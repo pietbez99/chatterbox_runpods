@@ -1,37 +1,32 @@
 """
 RunPod Serverless Handler for Chatterbox TTS
 
+Voice reference is baked into the Docker image at build time.
+The model loads with pre-prepared voice conditionals so every
+request is just: text in → audio out.
+
 Accepts:
   - text (str): Text to synthesize
-  - audio_url (str, optional): URL to voice reference audio for cloning
-  - exaggeration (float, optional): Voice exaggeration factor (default 0.5)
-  - temperature (float, optional): Generation temperature (default 0.8)
+  - exaggeration (float, optional): Voice exaggeration factor (default 0.3)
+  - temperature (float, optional): Generation temperature (default 0.7)
   - cfg (float, optional): CFG weight (default 0.5)
   - output_format (str, optional): "mp3" or "wav" (default "wav")
-
-Performance: Voice conditionals are cached after first download so subsequent
-requests skip the expensive audio processing step.
 """
 
-import os
 import io
 import base64
-import tempfile
-import requests
 import runpod
 import torch
 import torchaudio as ta
 from pydub import AudioSegment
 
-# Global model instance (loaded once on cold start)
+# Global model instance (loaded once on cold start, with voice pre-baked)
 MODEL = None
-
-# Cache: voice URL -> local file path (persists across requests on same worker)
-VOICE_CACHE = {}
+VOICE_REF_PATH = "/app/voice/reference.mp3"
 
 
 def load_model():
-    """Load ChatterboxTTS model once on cold start."""
+    """Load ChatterboxTTS model and prepare voice conditionals once on cold start."""
     global MODEL
     if MODEL is not None:
         return MODEL
@@ -42,49 +37,13 @@ def load_model():
     print(f"[Chatterbox] Loading model on device: {device}")
     MODEL = ChatterboxTTS.from_pretrained(device=device)
     print("[Chatterbox] Model loaded successfully")
+
+    # Prepare voice conditionals from baked-in reference audio
+    print(f"[Chatterbox] Preparing voice conditionals from: {VOICE_REF_PATH}")
+    MODEL.prepare_conditionals(VOICE_REF_PATH, exaggeration=0.3)
+    print("[Chatterbox] Voice conditionals ready - all requests will use this voice")
+
     return MODEL
-
-
-def get_voice_ref(url: str, model, exaggeration: float) -> None:
-    """
-    Download voice reference and prepare conditionals, with caching.
-    If the same URL was already processed, the model's self.conds are
-    already set and we skip the expensive prepare_conditionals() call.
-    """
-    if url in VOICE_CACHE:
-        # Voice already downloaded and conditionals prepared
-        # The model retains self.conds from the previous call
-        # Just check if exaggeration changed (generate() handles this)
-        print(f"[Chatterbox] Using cached voice for: {url}")
-        return
-
-    print(f"[Chatterbox] Downloading voice reference from: {url}")
-    response = requests.get(url, timeout=30)
-    response.raise_for_status()
-
-    # Determine file extension
-    content_type = response.headers.get("content-type", "")
-    if "mp3" in content_type or url.lower().split("?")[0].endswith(".mp3"):
-        ext = ".mp3"
-    elif "wav" in content_type or url.lower().split("?")[0].endswith(".wav"):
-        ext = ".wav"
-    else:
-        ext = ".mp3"
-
-    # Save to a persistent file (not auto-deleted)
-    tmp = tempfile.NamedTemporaryFile(suffix=ext, delete=False)
-    tmp.write(response.content)
-    tmp.close()
-    voice_path = tmp.name
-    print(f"[Chatterbox] Voice reference saved to: {voice_path} ({len(response.content)} bytes)")
-
-    # Prepare conditionals (the expensive step - embeds the voice)
-    print(f"[Chatterbox] Preparing voice conditionals (one-time)...")
-    model.prepare_conditionals(voice_path, exaggeration=exaggeration)
-    print(f"[Chatterbox] Voice conditionals ready")
-
-    # Cache for future requests
-    VOICE_CACHE[url] = voice_path
 
 
 def handler(job):
@@ -95,41 +54,28 @@ def handler(job):
     if not text:
         return {"error": "No text provided"}
 
-    audio_url = job_input.get("audio_url")
-    exaggeration = float(job_input.get("exaggeration", 0.5))
-    temperature = float(job_input.get("temperature", 0.8))
+    exaggeration = float(job_input.get("exaggeration", 0.3))
+    temperature = float(job_input.get("temperature", 0.7))
     cfg_weight = float(job_input.get("cfg", 0.5))
     output_format = job_input.get("output_format", "wav").lower()
 
     print(f"[Chatterbox] Generating TTS:")
     print(f"  text: {text[:100]}...")
-    print(f"  audio_url: {audio_url or 'NONE (using default voice)'}")
     print(f"  exaggeration: {exaggeration}")
     print(f"  temperature: {temperature}")
     print(f"  cfg: {cfg_weight}")
     print(f"  output_format: {output_format}")
-    print(f"  voice_cached: {audio_url in VOICE_CACHE if audio_url else 'N/A'}")
 
     model = load_model()
 
     try:
-        # Prepare voice conditionals (cached after first call)
-        if audio_url:
-            get_voice_ref(audio_url, model, exaggeration)
-            # Generate WITHOUT audio_prompt_path - reuses cached self.conds
-            wav = model.generate(
-                text,
-                exaggeration=exaggeration,
-                temperature=temperature,
-                cfg_weight=cfg_weight,
-            )
-        else:
-            wav = model.generate(
-                text,
-                exaggeration=exaggeration,
-                temperature=temperature,
-                cfg_weight=cfg_weight,
-            )
+        # Generate using pre-baked voice conditionals
+        wav = model.generate(
+            text,
+            exaggeration=exaggeration,
+            temperature=temperature,
+            cfg_weight=cfg_weight,
+        )
 
         # Convert to output format
         wav_buffer = io.BytesIO()
